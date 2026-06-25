@@ -95,6 +95,12 @@ document.addEventListener('DOMContentLoaded', function() {
   let mustJump = false;
   let gameOver = false;
 
+  // AI
+  let aiMode = false;
+  let aiThinking = false;
+  const AI_PLAYER = 'B';
+  const AI_DEPTH = 6;
+
   // Coordinate conversion helper
   function rowColToSquare(row, col) {
     const files = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
@@ -179,6 +185,139 @@ document.addEventListener('DOMContentLoaded', function() {
   }
 
   // Movement upfdates
+  const PST_BLACK = [
+    [0,  0,  0,  0,  0,  0,  0,  0],  // row 0 — promotion row (pieces become kings)
+    [0,  6,  0,  6,  0,  6,  0,  6],  // row 1 — almost promoted
+    [5,  0,  5,  0,  5,  0,  5,  0],  // row 2
+    [0,  3,  0,  4,  0,  4,  0,  3],  // row 3 — centre control
+    [2,  0,  3,  0,  3,  0,  2,  0],  // row 4 — midfield
+    [0,  1,  0,  2,  0,  2,  0,  1],  // row 5 — just behind start
+    [1,  0,  1,  0,  1,  0,  1,  0],  // row 6
+    [0,  0,  0,  0,  0,  0,  0,  0],  // row 7 — Black start row
+  ];
+  // PST for White is the vertical mirror of Black's table
+  const PST_WHITE = PST_BLACK.map(r => [...r]).reverse();
+
+  // Static board evaluation — positive = good for AI (Black)
+  function evaluateBoard(b) {
+    let score = 0;
+    for (let r = 0; r < BOARD_SIZE; r++) {
+      for (let c = 0; c < BOARD_SIZE; c++) {
+        const p = b[r][c];
+        if (!p) continue;
+        const isB  = p[0] === 'B';
+        const isK  = p.includes('K');
+        const sign = isB ? 1 : -1;
+        //  king = 1.75× a regular piece
+        score += sign * (isK ? 175 : 100);
+        if (!isK) score += sign * (isB ? PST_BLACK[r][c] : PST_WHITE[r][c]);
+        if (!isK) {
+          if ( isB && r === 7) score += 15;
+          if (!isB && r === 0) score -= 15;
+        }
+      }
+    }
+    return score;
+  }
+
+  // Returns jumps array when any jump is available 
+  function getMoves(b, player) {
+    const moves = [], jumps = [];
+    for (let r = 0; r < BOARD_SIZE; r++) {
+      for (let c = 0; c < BOARD_SIZE; c++) {
+        const p = b[r][c];
+        if (!p || p[0] !== player) continue;
+        const isK = p.includes('K');
+        const dirs = isK
+          ? [[-1,-1],[-1,1],[1,-1],[1,1]]
+          : player === 'W' ? [[1,-1],[1,1]] : [[-1,-1],[-1,1]];
+        for (const [dr, dc] of dirs) {
+          const nr = r+dr, nc = c+dc;
+          if (nr < 0 || nr >= BOARD_SIZE || nc < 0 || nc >= BOARD_SIZE) continue;
+          if (!b[nr][nc]) {
+            moves.push([r, c, nr, nc]);
+          } else if (b[nr][nc][0] !== player) {
+            const jr = r+dr*2, jc = c+dc*2;
+            if (jr >= 0 && jr < BOARD_SIZE && jc >= 0 && jc < BOARD_SIZE && !b[jr][jc]) {
+              jumps.push([r, c, jr, jc]);
+            }
+          }
+        }
+      }
+    }
+    return jumps.length ? jumps : moves;
+  }
+
+  // Return a new board with move 
+  function applyMove(b, move) {
+    const [fr, fc, tr, tc] = move;
+    const nb = b.map(r => [...r]);
+    const p = nb[fr][fc];
+    nb[tr][tc] = (p === 'W' && tr === BOARD_SIZE-1) ? 'WK'
+               : (p === 'B' && tr === 0)             ? 'BK'
+               : p;
+    nb[fr][fc] = '';
+    if (Math.abs(tr-fr) === 2) nb[fr+(tr-fr)/2][fc+(tc-fc)/2] = '';
+    return nb;
+  }
+
+  // a-b pruning.
+  // `maximize` is true when we're evaluating from the perspective of the AI (Black).
+  // Returns [bestScore, bestMove].
+  function minimax(b, depth, alpha, beta, maximize) {
+    const player = maximize ? 'B' : 'W';
+    const moves  = getMoves(b, player);
+    if (depth === 0 || !moves.length) return [evaluateBoard(b), null];
+    let best = maximize ? -Infinity : Infinity;
+    let bestMove = null;
+    for (const mv of moves) {
+      const [s] = minimax(applyMove(b, mv), depth-1, alpha, beta, !maximize);
+      if (maximize ? s > best : s < best) { best = s; bestMove = mv; }
+      if (maximize) alpha = Math.max(alpha, best);
+      else          beta  = Math.min(beta,  best);
+      if (beta <= alpha) break; // prune — this branch won't be chosen
+    }
+    return [best, bestMove];
+  }
+
+  // AI turn on the live board.
+  // Handles  multi-jump chains by calling itself multiple times.
+  function doAIMove() {
+    if (!aiMode || gameOver || currentPlayer[0] !== AI_PLAYER) return;
+    aiThinking = true;
+    gameInfo.textContent = "AI is thinking…";
+
+    setTimeout(() => {
+      let move;
+      if (mustJump && selectedPiece) {
+        // do A forced multi-jump from the piece that just captured
+        const p    = board[selectedPiece.row][selectedPiece.col];
+        const isK  = p.includes('K');
+        const dirs = isK ? [[-1,-1],[-1,1],[1,-1],[1,1]] : [[-1,-1],[-1,1]];
+        for (const [dr, dc] of dirs) {
+          const mr = selectedPiece.row+dr,  mc = selectedPiece.col+dc;
+          const jr = selectedPiece.row+dr*2, jc = selectedPiece.col+dc*2;
+          if (jr >= 0 && jr < BOARD_SIZE && jc >= 0 && jc < BOARD_SIZE &&
+              board[mr]?.[mc]?.[0] === 'W' && !board[jr][jc]) {
+            move = [selectedPiece.row, selectedPiece.col, jr, jc];
+            break;
+          }
+        }
+      } else {
+        const [, best] = minimax(board, AI_DEPTH, -Infinity, Infinity, true);
+        move = best;
+      }
+
+      if (move) {
+        const cont = makeMove(move[0], move[1], move[2], move[3]);
+        render();
+        if (!cont) { doAIMove(); return; } // multi-jump — keep going
+      }
+      aiThinking = false;
+      render();
+    }, 250);
+  }
+
   function makeMove(fromRow, fromCol, toRow, toCol) {
     const piece = board[fromRow][fromCol];
     const wasKing = piece.includes("K");
@@ -375,6 +514,7 @@ document.addEventListener('DOMContentLoaded', function() {
   // Click suff
   canvas.addEventListener('click', function(e) {
     if (gameOver) return;
+    if (aiMode && (currentPlayer[0] === AI_PLAYER || aiThinking)) return;
     
     const rect = canvas.getBoundingClientRect();
     const col = Math.floor((e.clientX - rect.left) / SQUARE_SIZE);
@@ -401,6 +541,7 @@ document.addEventListener('DOMContentLoaded', function() {
       if (rowDiff === 1 && colDiff === 1 && !mustJump) {
         makeMove(selectedPiece.row, selectedPiece.col, row, col);
         render();
+        doAIMove();
       }
       else if (rowDiff === 2 && colDiff === 2) {
         const middleRow = selectedPiece.row + (row - selectedPiece.row) / 2;
@@ -410,6 +551,7 @@ document.addEventListener('DOMContentLoaded', function() {
         if (middlePiece && !middlePiece.includes(currentPlayer[0])) {
           makeMove(selectedPiece.row, selectedPiece.col, row, col);
           render();
+          if (!mustJump) doAIMove(); // only hand off to AI once player's chain is done
         }
       }
     }
@@ -425,6 +567,7 @@ document.addEventListener('DOMContentLoaded', function() {
     selectedPiece = null;
     mustJump = false;
     gameOver = false;
+    aiThinking = false;
     setupBoard();
     render();
   }
@@ -468,6 +611,16 @@ document.addEventListener('DOMContentLoaded', function() {
   if (backBtn) {
     backBtn.addEventListener('click', function() {
       window.location.href = '/';
+    });
+  }
+
+  // AI toggle
+  const aiBtn = document.getElementById("toggleAI");
+  if (aiBtn) {
+    aiBtn.addEventListener('click', function() {
+      aiMode = !aiMode;
+      aiBtn.textContent = `AI: ${aiMode ? 'ON  (you play White)' : 'OFF'}`;
+      resetGame();
     });
   }
 
